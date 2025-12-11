@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
-  event::{self, Event, KeyCode, KeyEventKind},
+  event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
   execute,
   terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -27,8 +27,6 @@ use syntect::{
 
 #[derive(Debug)]
 struct CommitEntry {
-  hash: String,
-  short: String,
   date: String,
   author: String,
   subject: String,
@@ -119,24 +117,24 @@ fn main() -> Result<()> {
 
   loop {
     let size = terminal.get_frame().size();
-    let body_height = body_height(size.height, app.status.is_some());
+    let body_height = body_height(size.height);
     adjust_scroll(&mut app, body_height);
 
-    terminal.draw(|f| draw_app(f, &app, body_height))?;
+    terminal.draw(|f| draw_app(f, &app, body_height, size.width))?;
 
     match read_single_key()? {
       UserCommand::Next => {
-        if app.index + 1 < app.entries.len() {
-          app.index += 1;
-        } else {
-          app.status = Some("Already at the oldest revision.".into());
-        }
-      }
-      UserCommand::Prev => {
         if app.index > 0 {
           app.index -= 1;
         } else {
           app.status = Some("Already at the newest revision.".into());
+        }
+      }
+      UserCommand::Prev => {
+        if app.index + 1 < app.entries.len() {
+          app.index += 1;
+        } else {
+          app.status = Some("Already at the oldest revision.".into());
         }
       }
       UserCommand::Goto => {
@@ -147,20 +145,10 @@ fn main() -> Result<()> {
         }
       }
       UserCommand::ScrollDown => {
-        let max_off = max_scroll(total_lines(&app.entries[app.index]), body_height);
-        if app.scroll < max_off {
-          app.scroll += 1;
-          app.cursor_row = app
-            .cursor_row
-            .saturating_add(1)
-            .min(body_height as usize - 1);
-        }
+        move_cursor_line(&mut app, body_height, 1);
       }
       UserCommand::ScrollUp => {
-        if app.scroll > 0 {
-          app.scroll -= 1;
-          app.cursor_row = app.cursor_row.saturating_sub(1);
-        }
+        move_cursor_line(&mut app, body_height, -1);
       }
       UserCommand::PageDown => {
         let max_off = max_scroll(total_lines(&app.entries[app.index]), body_height);
@@ -179,29 +167,29 @@ fn main() -> Result<()> {
   Ok(())
 }
 
-fn draw_app(f: &mut Frame, app: &AppState, body_height: u16) {
+fn draw_app(f: &mut Frame, app: &AppState, body_height: u16, width: u16) {
   let chunks = Layout::default()
     .direction(Direction::Vertical)
     .constraints([
-      Constraint::Length(2),
+      Constraint::Length(3),
       Constraint::Min(3),
-      Constraint::Length(1),
       Constraint::Length(1),
     ])
     .split(f.size());
 
   let entry = &app.entries[app.index];
-  let header = format!(
-    "[{}/{}] {} ({}) {} {}",
+  let header_line1 = Line::from(format!(
+    "[{}/{}] {}",
     app.index + 1,
     app.entries.len(),
-    entry.hash,
-    entry.short,
-    entry.date,
-    entry.author
-  );
-  let subject = entry.subject.clone();
-  let status = app.status.clone().unwrap_or_default();
+    entry.date
+  ));
+  let header_line2 = Line::from(vec![
+    Span::styled(&entry.author, Style::default().fg(Color::Rgb(255, 165, 0))),
+    Span::raw(": "),
+    Span::styled(&entry.subject, Style::default().fg(Color::Yellow)),
+  ]);
+  let separator = "─".repeat(width.max(1) as usize);
 
   let (body_widget, view_len) = match &entry.content {
     FileContent::Text(text) => {
@@ -216,10 +204,10 @@ fn draw_app(f: &mut Frame, app: &AppState, body_height: u16) {
     ),
   };
 
-  let header_widget = Paragraph::new(format!("{header}\n{subject}")).block(Block::default());
+  let header_widget =
+    Paragraph::new(vec![header_line1, header_line2, Line::from(separator)]).block(Block::default());
   let footer_widget = Paragraph::new("Commands: n/p/g/q | Scroll: j/k, PgUp/PgDn, arrows")
     .block(Block::default().borders(Borders::TOP));
-  let status_widget = Paragraph::new(status);
 
   f.render_widget(header_widget, chunks[0]);
   f.render_widget(body_widget, chunks[1]);
@@ -228,7 +216,6 @@ fn draw_app(f: &mut Frame, app: &AppState, body_height: u16) {
     f.set_cursor(chunks[1].x, chunks[1].y + rel as u16);
   }
   f.render_widget(footer_widget, chunks[2]);
-  f.render_widget(status_widget, chunks[3]);
 
   // Adjust body area height if terminal resized; already passed in.
   let _ = body_height;
@@ -381,6 +368,12 @@ fn read_single_key() -> Result<UserCommand> {
   loop {
     match event::read()? {
       Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+          return Ok(UserCommand::ScrollDown);
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+          return Ok(UserCommand::ScrollUp);
+        }
         KeyCode::Char('n') => return Ok(UserCommand::Next),
         KeyCode::Char('p') => return Ok(UserCommand::Prev),
         KeyCode::Char('g') => return Ok(UserCommand::Goto),
@@ -425,6 +418,13 @@ fn adjust_scroll(app: &mut AppState, body_height: u16) {
   if app.scroll > max_off {
     app.scroll = max_off;
   }
+  // Clamp cursor row so it stays within the visible area.
+  let visible_lines = (body_height as usize).min(total.saturating_sub(app.scroll));
+  if visible_lines == 0 {
+    app.cursor_row = 0;
+  } else {
+    app.cursor_row = app.cursor_row.min(visible_lines - 1);
+  }
 }
 
 fn total_lines(entry: &CommitEntry) -> usize {
@@ -434,13 +434,52 @@ fn total_lines(entry: &CommitEntry) -> usize {
   }
 }
 
-fn body_height(terminal_height: u16, has_status: bool) -> u16 {
-  let reserved = 2 + 1 + 1 + u16::from(has_status);
+fn body_height(terminal_height: u16) -> u16 {
+  // header 3 lines + footer 1 line
+  let reserved = 4;
   terminal_height.saturating_sub(reserved).max(1)
 }
 
 fn max_scroll(total_lines: usize, body_height: u16) -> usize {
   total_lines.saturating_sub(body_height as usize)
+}
+
+fn move_cursor_line(app: &mut AppState, body_height: u16, delta: isize) {
+  let total = total_lines(&app.entries[app.index]);
+  if total == 0 {
+    return;
+  }
+
+  let current_abs = app.scroll + app.cursor_row;
+  let target_abs = if delta > 0 {
+    let step = delta as usize;
+    let target = current_abs + step;
+    if target >= total {
+      return;
+    }
+    target
+  } else {
+    let step = delta.unsigned_abs() as usize;
+    if current_abs < step {
+      return;
+    }
+    current_abs - step
+  };
+
+  let body_height = body_height as usize;
+  let visible_end = app.scroll + body_height.saturating_sub(1);
+  if target_abs > visible_end {
+    app.scroll = target_abs + 1 - body_height;
+  } else if target_abs < app.scroll {
+    app.scroll = target_abs;
+  }
+
+  let max_off = max_scroll(total, body_height as u16);
+  if app.scroll > max_off {
+    app.scroll = max_off;
+  }
+
+  app.cursor_row = target_abs.saturating_sub(app.scroll);
 }
 
 fn repo_root_for(path: &Path) -> Result<PathBuf> {
@@ -511,8 +550,8 @@ fn build_history(repo_root: &Path, path: &Path) -> Result<Vec<CommitEntry>> {
     if parts.len() < 5 {
       continue;
     }
-    let hash = parts[0].to_string();
-    let short = parts[1].to_string();
+    let _hash = parts[0];
+    let _short = parts[1];
     let date = parts[2].to_string();
     let author = parts[3].to_string();
     let subject = parts[4].to_string();
@@ -535,10 +574,8 @@ fn build_history(repo_root: &Path, path: &Path) -> Result<Vec<CommitEntry>> {
     let commit_path = current_path.clone();
 
     if !deleted {
-      if let Some(content) = read_file_at_commit(repo_root, &hash, &commit_path)? {
+      if let Some(content) = read_file_at_commit(repo_root, _hash, &commit_path)? {
         entries.push(CommitEntry {
-          hash,
-          short,
           date,
           author,
           subject,
