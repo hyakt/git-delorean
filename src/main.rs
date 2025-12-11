@@ -294,25 +294,10 @@ fn style_to_tui(style: SynStyle) -> Style {
 }
 
 fn pick_theme(set: &ThemeSet) -> Theme {
-  if let Ok(name) = env::var("GIT_DELOREAN_THEME") {
-    if let Some(t) = set.themes.get(&name) {
-      return t.clone();
-    }
-  }
-
-  // Prefer neutral/dark themes that resemble typical defaults.
-  let preferred = [
-    "Monokai Extended",
-    "OneHalfDark",
-    "base16-ocean.dark",
-    "base16-eighties.dark",
-    "Solarized (dark)",
-    "InspiredGitHub",
-  ];
-  preferred
-    .iter()
-    .find_map(|name| set.themes.get(*name).cloned())
-    .or_else(|| set.themes.values().next().cloned())
+  set
+    .themes
+    .get("InspiredGitHub")
+    .cloned()
     .unwrap_or_else(|| Theme::default())
 }
 
