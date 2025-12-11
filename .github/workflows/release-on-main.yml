@@ -1,0 +1,89 @@
+name: Release on main push
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: macos-latest
+            artifact: macos-x86_64
+          - os: windows-latest
+            artifact: windows-x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Read crate version
+        shell: bash
+        run: echo "VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp target/release/git-delorean.exe dist/
+            ASSET=git-delorean-${{ env.VERSION }}-${{ matrix.artifact }}.zip
+            7z a "$ASSET" -r dist/*
+            echo "ASSET_PATH=$ASSET" >> "$GITHUB_ENV"
+          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            cp target/release/git-delorean dist/
+            ASSET=git-delorean-${{ env.VERSION }}-${{ matrix.artifact }}.tar.gz
+            tar -C dist -czf "$ASSET" .
+            echo "ASSET_PATH=$ASSET" >> "$GITHUB_ENV"
+          else
+            cp target/release/git-delorean dist/
+            ASSET=git-delorean-${{ env.VERSION }}-${{ matrix.artifact }}.tar.gz
+            tar -C dist -czf "$ASSET" .
+            echo "ASSET_PATH=$ASSET" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-delorean-${{ env.VERSION }}-${{ matrix.artifact }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Read crate version
+        run: echo "VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')" >> "$GITHUB_ENV"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ env.VERSION }}
+          generate_release_notes: true
+          target_commitish: main
+          files: artifacts/**/*
