@@ -1,8 +1,8 @@
 use std::{
-  env,
-  io::{self, Write},
+  env, io,
   path::{Component, Path, PathBuf},
   process::Command,
+  time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,7 +16,7 @@ use ratatui::{
   layout::{Constraint, Direction, Layout},
   prelude::*,
   text::{Line, Span},
-  widgets::{Block, Borders, Paragraph, Wrap},
+  widgets::{Block, Paragraph, Wrap},
 };
 use syntect::{
   easy::HighlightLines,
@@ -24,12 +24,15 @@ use syntect::{
   parsing::{SyntaxReference, SyntaxSet},
   util::LinesWithEndings,
 };
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug)]
 struct CommitEntry {
   date: String,
   author: String,
   subject: String,
+  short_hash: String,
+  hash: String,
   path: PathBuf,
   content: FileContent,
   spans: OnceCell<Vec<Line<'static>>>,
@@ -45,7 +48,7 @@ enum FileContent {
 enum UserCommand {
   Next,
   Prev,
-  Goto,
+  OpenPr,
   ScrollDown,
   ScrollUp,
   PageDown,
@@ -60,7 +63,13 @@ struct AppState {
   index: usize,
   scroll: usize,
   status: Option<String>,
+  status_until: Option<Instant>,
   cursor_row: usize,
+}
+
+fn set_status(app: &mut AppState, msg: impl Into<String>, secs: u64) {
+  app.status = Some(msg.into());
+  app.status_until = Some(Instant::now() + Duration::from_secs(secs));
 }
 
 static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(SyntaxSet::load_defaults_newlines);
@@ -113,10 +122,18 @@ fn main() -> Result<()> {
     index: 0,
     scroll: 0,
     status: None,
+    status_until: None,
     cursor_row: 0,
   };
 
   loop {
+    if let Some(until) = app.status_until {
+      if Instant::now() >= until {
+        app.status = None;
+        app.status_until = None;
+      }
+    }
+
     let size = terminal.get_frame().size();
     let body_height = body_height(size.height);
     adjust_scroll(&mut app, body_height);
@@ -128,23 +145,28 @@ fn main() -> Result<()> {
         if app.index > 0 {
           app.index -= 1;
         } else {
-          app.status = Some("Already at the newest revision.".into());
+          set_status(&mut app, "Already at the newest revision.", 2);
         }
       }
       UserCommand::Prev => {
         if app.index + 1 < app.entries.len() {
           app.index += 1;
         } else {
-          app.status = Some("Already at the oldest revision.".into());
+          set_status(&mut app, "Already at the oldest revision.", 2);
         }
       }
-      UserCommand::Goto => {
-        if let Some(new_idx) = prompt_goto(app.entries.len())? {
-          app.index = new_idx;
-        } else {
-          app.status = Some("Invalid index.".into());
+      UserCommand::OpenPr => match open_pr(&repo_root, &app.entries[app.index].hash) {
+        Ok(msg) => {
+          if let Some(m) = msg {
+            set_status(&mut app, m, 2);
+          } else {
+            set_status(&mut app, "PR opened in browser.", 2);
+          }
         }
-      }
+        Err(e) => {
+          set_status(&mut app, format!("PR open failed: {}", e), 2);
+        }
+      },
       UserCommand::ScrollDown => {
         move_cursor_line(&mut app, body_height, 1);
       }
@@ -168,38 +190,66 @@ fn main() -> Result<()> {
   Ok(())
 }
 
-fn draw_app(f: &mut Frame, app: &AppState, body_height: u16, width: u16) {
+fn draw_app(f: &mut Frame, app: &AppState, body_height: u16, _width: u16) {
   let chunks = Layout::default()
     .direction(Direction::Vertical)
     .constraints([
-      Constraint::Length(3),
-      Constraint::Min(3),
+      Constraint::Length(1),
+      Constraint::Min(1),
       Constraint::Length(1),
     ])
     .split(f.size());
 
   let entry = &app.entries[app.index];
-  let header_line1 = Line::from(format!(
-    "[{}/{}] {}",
-    app.index + 1,
-    app.entries.len(),
-    entry.date
-  ));
-  let header_line2 = Line::from(vec![
-    Span::styled(&entry.author, Style::default().fg(Color::Rgb(255, 165, 0))),
+  let idx_span = Span::styled(
+    format!("[{}/{}] ", app.index + 1, app.entries.len()),
+    Style::default().fg(Color::Rgb(160, 160, 160)),
+  );
+  let author_span = Span::styled(
+    entry.author.clone(),
+    Style::default().fg(Color::Rgb(255, 165, 0)),
+  );
+  let subject_span = Span::styled(
+    entry.subject.clone(),
+    Style::default().fg(Color::Rgb(255, 215, 0)),
+  );
+  let date_span = Span::styled(
+    format_datetime(&entry.date),
+    Style::default().fg(Color::Rgb(128, 189, 255)),
+  );
+  let hash_span = Span::styled(
+    format!("({})", entry.short_hash),
+    Style::default().fg(Color::Rgb(160, 160, 160)),
+  );
+  let header_line = Line::from(vec![
+    idx_span,
+    author_span,
     Span::raw(": "),
-    Span::styled(&entry.subject, Style::default().fg(Color::Yellow)),
+    subject_span,
+    Span::raw(" "),
+    date_span,
+    Span::raw(" "),
+    hash_span,
   ]);
-  let separator = "─".repeat(width.max(1) as usize);
-
   let spans = rendered_lines(entry);
-  let (view, view_len) = spans_to_lines_with_cursor(spans, app.scroll, body_height, app.cursor_row);
+  let body_width = chunks[1].width as usize;
+  let (view, view_len) =
+    spans_to_lines_with_cursor(spans, app.scroll, body_height, app.cursor_row, body_width);
   let body_widget = Paragraph::new(view).wrap(Wrap { trim: false });
 
+  let header_bg = Color::Rgb(12, 12, 12);
   let header_widget =
-    Paragraph::new(vec![header_line1, header_line2, Line::from(separator)]).block(Block::default());
-  let footer_widget = Paragraph::new("Commands: n/p/g/q | Scroll: j/k, PgUp/PgDn, arrows")
-    .block(Block::default().borders(Borders::TOP));
+    Paragraph::new(header_line).block(Block::default().style(Style::default().bg(header_bg)));
+
+  let commands = "Keys: n(next) p(prev) o(open PR) q(quit) | Scroll: j/k";
+  let footer_text = app
+    .status
+    .clone()
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| commands.into());
+  let footer_bg = Color::Rgb(8, 8, 8);
+  let footer_widget =
+    Paragraph::new(footer_text).block(Block::default().style(Style::default().bg(footer_bg)));
 
   f.render_widget(header_widget, chunks[0]);
   f.render_widget(body_widget, chunks[1]);
@@ -252,6 +302,7 @@ fn spans_to_lines_with_cursor(
   scroll: usize,
   body_height: u16,
   cursor_row: usize,
+  body_width: usize,
 ) -> (Vec<Line<'static>>, usize) {
   let start = scroll;
   let end = (scroll + body_height as usize).min(spans.len());
@@ -276,6 +327,12 @@ fn spans_to_lines_with_cursor(
             span
           })
           .collect();
+        // 行末以降も背景が途切れないように右端まで空白を追加。
+        let current_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
+        if body_width > current_width {
+          let pad = " ".repeat(body_width - current_width);
+          line.spans.push(Span::styled(pad, cursor_style));
+        }
       }
       line
     })
@@ -297,6 +354,16 @@ fn pick_theme(set: &ThemeSet) -> Theme {
     .get("InspiredGitHub")
     .cloned()
     .unwrap_or_else(|| Theme::default())
+}
+
+fn format_datetime(iso: &str) -> String {
+  if iso.len() >= 16 {
+    let date = iso[0..10].replace('-', "/");
+    let time = &iso[11..16];
+    format!("{date} {time}")
+  } else {
+    iso.to_string()
+  }
 }
 
 fn syntax_for<'a>(path: &Path, text: &'a str) -> &'a SyntaxReference {
@@ -351,6 +418,8 @@ fn read_single_key() -> Result<UserCommand> {
   loop {
     match event::read()? {
       Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+        // Ignore IME確定などで飛んでくる非ASCIIキー。
+        KeyCode::Char(c) if !c.is_ascii() => return Ok(UserCommand::None),
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
           return Ok(UserCommand::ScrollDown);
         }
@@ -359,7 +428,7 @@ fn read_single_key() -> Result<UserCommand> {
         }
         KeyCode::Char('n') => return Ok(UserCommand::Next),
         KeyCode::Char('p') => return Ok(UserCommand::Prev),
-        KeyCode::Char('g') => return Ok(UserCommand::Goto),
+        KeyCode::Char('o') => return Ok(UserCommand::OpenPr),
         KeyCode::Char('j') | KeyCode::Down => return Ok(UserCommand::ScrollDown),
         KeyCode::Char('k') | KeyCode::Up => return Ok(UserCommand::ScrollUp),
         KeyCode::Char('f') | KeyCode::PageDown => return Ok(UserCommand::PageDown),
@@ -369,29 +438,6 @@ fn read_single_key() -> Result<UserCommand> {
       },
       _ => {}
     }
-  }
-}
-
-fn prompt_goto(total: usize) -> Result<Option<usize>> {
-  disable_raw_mode()?;
-  execute!(io::stdout(), LeaveAlternateScreen)?;
-  print!("Goto index (1-{}): ", total);
-  io::stdout().flush()?;
-  let mut input = String::new();
-  let read = io::stdin().read_line(&mut input)?;
-  execute!(io::stdout(), EnterAlternateScreen)?;
-  enable_raw_mode()?;
-
-  if read == 0 {
-    return Ok(None);
-  }
-  let trimmed = input.trim();
-  if trimmed.is_empty() {
-    return Ok(None);
-  }
-  match trimmed.parse::<usize>() {
-    Ok(n) if (1..=total).contains(&n) => Ok(Some(n - 1)),
-    _ => Ok(None),
   }
 }
 
@@ -415,8 +461,8 @@ fn total_lines(entry: &CommitEntry) -> usize {
 }
 
 fn body_height(terminal_height: u16) -> u16 {
-  // header 3 lines + footer 1 line
-  let reserved = 4;
+  // header 1 line + footer 1 line
+  let reserved = 2;
   terminal_height.saturating_sub(reserved).max(1)
 }
 
@@ -530,8 +576,8 @@ fn build_history(repo_root: &Path, path: &Path) -> Result<Vec<CommitEntry>> {
     if parts.len() < 5 {
       continue;
     }
-    let _hash = parts[0];
-    let _short = parts[1];
+    let hash = parts[0];
+    let short = parts[1];
     let date = parts[2].to_string();
     let author = parts[3].to_string();
     let subject = parts[4].to_string();
@@ -554,11 +600,13 @@ fn build_history(repo_root: &Path, path: &Path) -> Result<Vec<CommitEntry>> {
     let commit_path = current_path.clone();
 
     if !deleted {
-      if let Some(content) = read_file_at_commit(repo_root, _hash, &commit_path)? {
+      if let Some(content) = read_file_at_commit(repo_root, hash, &commit_path)? {
         entries.push(CommitEntry {
           date,
           author,
           subject,
+          short_hash: short.to_string(),
+          hash: hash.to_string(),
           path: commit_path.clone(),
           content,
           spans: OnceCell::new(),
@@ -621,6 +669,48 @@ fn read_file_at_commit(repo_root: &Path, hash: &str, path: &Path) -> Result<Opti
 
   let text = String::from_utf8_lossy(&bytes).to_string();
   Ok(Some(FileContent::Text(text)))
+}
+
+fn open_pr(repo_root: &Path, base_hash: &str) -> Result<Option<String>> {
+  let range = format!("{base_hash}..HEAD");
+  let log = git_output(
+    &[
+      "log",
+      "--merges",
+      "--oneline",
+      "--reverse",
+      "--ancestry-path",
+      &range,
+    ],
+    Some(repo_root),
+  )?;
+
+  let mut pr_number: Option<String> = None;
+  for line in log.lines() {
+    if let Some(idx) = line.find("Merge pull request #") {
+      let rest = &line[idx + "Merge pull request #".len()..];
+      let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+      if !digits.is_empty() {
+        pr_number = Some(digits);
+        break;
+      }
+    }
+  }
+
+  if let Some(pr) = pr_number {
+    let status = Command::new("gh")
+      .args(["pr", "view", "--web", &pr])
+      .current_dir(repo_root)
+      .status()
+      .with_context(|| "Failed to run gh")?;
+    if status.success() {
+      Ok(None)
+    } else {
+      bail!("gh pr view exited with {}", status);
+    }
+  } else {
+    Ok(Some("No PR found on ancestry path.".into()))
+  }
 }
 
 fn git_output(args: &[&str], cwd: Option<&Path>) -> Result<String> {

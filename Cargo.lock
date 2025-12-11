@@ -196,6 +196,7 @@ dependencies = [
  "once_cell",
  "ratatui",
  "syntect",
+ "unicode-width",
 ]
 
 [[package]]
