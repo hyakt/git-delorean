@@ -264,10 +264,8 @@ fn spans_to_lines_with_cursor(
     .map(|(i, line)| {
       let mut line = line.clone();
       if i - start == cursor_row {
-        let cursor_style = Style::default()
-          .bg(Color::Rgb(0, 255, 0))
-          .fg(Color::Rgb(0, 0, 0))
-          .add_modifier(Modifier::BOLD);
+        // やや明るめの #2A2723 で現在行を強調。
+        let cursor_style = Style::default().bg(Color::Rgb(42, 39, 35));
         line.style = line.style.patch(cursor_style);
         line.spans = line
           .spans
