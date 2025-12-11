@@ -11,7 +11,7 @@ use crossterm::{
   execute,
   terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use ratatui::{
   layout::{Constraint, Direction, Layout},
   prelude::*,
@@ -32,6 +32,7 @@ struct CommitEntry {
   subject: String,
   path: PathBuf,
   content: FileContent,
+  spans: OnceCell<Vec<Line<'static>>>,
 }
 
 #[derive(Debug)]
@@ -191,18 +192,9 @@ fn draw_app(f: &mut Frame, app: &AppState, body_height: u16, width: u16) {
   ]);
   let separator = "─".repeat(width.max(1) as usize);
 
-  let (body_widget, view_len) = match &entry.content {
-    FileContent::Text(text) => {
-      let spans = highlight_to_spans(text, &entry.path);
-      let (view, view_len) =
-        spans_to_lines_with_cursor(spans, app.scroll, body_height, app.cursor_row);
-      (Paragraph::new(view).wrap(Wrap { trim: false }), view_len)
-    }
-    FileContent::Binary(size) => (
-      Paragraph::new(format!("[binary file: {} bytes]", size)).wrap(Wrap { trim: false }),
-      1,
-    ),
-  };
+  let spans = rendered_lines(entry);
+  let (view, view_len) = spans_to_lines_with_cursor(spans, app.scroll, body_height, app.cursor_row);
+  let body_widget = Paragraph::new(view).wrap(Wrap { trim: false });
 
   let header_widget =
     Paragraph::new(vec![header_line1, header_line2, Line::from(separator)]).block(Block::default());
@@ -248,8 +240,15 @@ fn highlight_to_spans(text: &str, path: &Path) -> Vec<Line<'static>> {
   lines
 }
 
+fn rendered_lines(entry: &CommitEntry) -> &Vec<Line<'static>> {
+  entry.spans.get_or_init(|| match &entry.content {
+    FileContent::Text(text) => highlight_to_spans(text, &entry.path),
+    FileContent::Binary(size) => vec![Line::from(format!("[binary file: {} bytes]", size))],
+  })
+}
+
 fn spans_to_lines_with_cursor(
-  spans: Vec<Line<'static>>,
+  spans: &[Line<'static>],
   scroll: usize,
   body_height: u16,
   cursor_row: usize,
@@ -258,11 +257,12 @@ fn spans_to_lines_with_cursor(
   let end = (scroll + body_height as usize).min(spans.len());
   let view_len = end.saturating_sub(start);
   let view = spans
-    .into_iter()
+    .iter()
     .enumerate()
     .skip(start)
     .take(view_len)
-    .map(|(i, mut line)| {
+    .map(|(i, line)| {
+      let mut line = line.clone();
       if i - start == cursor_row {
         let cursor_style = Style::default()
           .bg(Color::Rgb(0, 255, 0))
@@ -413,10 +413,7 @@ fn adjust_scroll(app: &mut AppState, body_height: u16) {
 }
 
 fn total_lines(entry: &CommitEntry) -> usize {
-  match &entry.content {
-    FileContent::Text(text) => text.lines().count().max(1),
-    FileContent::Binary(_) => 1,
-  }
+  rendered_lines(entry).len().max(1)
 }
 
 fn body_height(terminal_height: u16) -> u16 {
@@ -566,6 +563,7 @@ fn build_history(repo_root: &Path, path: &Path) -> Result<Vec<CommitEntry>> {
           subject,
           path: commit_path.clone(),
           content,
+          spans: OnceCell::new(),
         });
       }
     }
