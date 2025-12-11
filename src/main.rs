@@ -315,7 +315,6 @@ fn spans_to_lines_with_cursor(
     .map(|(i, line)| {
       let mut line = line.clone();
       if i - start == cursor_row {
-        // やや明るめの #2A2723 で現在行を強調。
         let cursor_style = Style::default().bg(Color::Rgb(42, 39, 35));
         line.style = line.style.patch(cursor_style);
         line.spans = line
@@ -327,7 +326,7 @@ fn spans_to_lines_with_cursor(
             span
           })
           .collect();
-        // 行末以降も背景が途切れないように右端まで空白を追加。
+        // Pad to the right so the highlight reaches the terminal edge.
         let current_width: usize = line.spans.iter().map(|s| s.content.width()).sum();
         if body_width > current_width {
           let pad = " ".repeat(body_width - current_width);
@@ -418,7 +417,7 @@ fn read_single_key() -> Result<UserCommand> {
   loop {
     match event::read()? {
       Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-        // Ignore IME確定などで飛んでくる非ASCIIキー。
+        // Ignore non-ASCII keys such as IME commit events.
         KeyCode::Char(c) if !c.is_ascii() => return Ok(UserCommand::None),
         KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
           return Ok(UserCommand::ScrollDown);
