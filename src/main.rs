@@ -350,7 +350,7 @@ fn style_to_tui(style: SynStyle) -> Style {
 fn pick_theme(set: &ThemeSet) -> Theme {
   set
     .themes
-    .get("InspiredGitHub")
+    .get("base16-ocean.dark")
     .cloned()
     .unwrap_or_else(|| Theme::default())
 }
