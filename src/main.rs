@@ -1,4 +1,5 @@
 use std::{
+  borrow::Cow,
   env, io,
   path::{Component, Path, PathBuf},
   process::Command,
@@ -16,15 +17,14 @@ use ratatui::{
   layout::{Constraint, Direction, Layout},
   prelude::*,
   text::{Line, Span},
-  widgets::{Block, Paragraph, Wrap},
+  widgets::{Block, Clear, Paragraph, Wrap},
 };
 use syntect::{
   easy::HighlightLines,
   highlighting::{Style as SynStyle, Theme, ThemeSet},
   parsing::{SyntaxReference, SyntaxSet},
-  util::LinesWithEndings,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug)]
 struct CommitEntry {
@@ -191,6 +191,9 @@ fn main() -> Result<()> {
 }
 
 fn draw_app(f: &mut Frame, app: &AppState, body_height: u16, _width: u16) {
+  // Clear the entire frame first so stale glyphs from longer previous files disappear.
+  f.render_widget(Clear, f.size());
+
   let chunks = Layout::default()
     .direction(Direction::Vertical)
     .constraints([
@@ -252,6 +255,7 @@ fn draw_app(f: &mut Frame, app: &AppState, body_height: u16, _width: u16) {
     Paragraph::new(footer_text).block(Block::default().style(Style::default().bg(footer_bg)));
 
   f.render_widget(header_widget, chunks[0]);
+  f.render_widget(Clear, chunks[1]); // Avoid stale text when line lengths shrink between commits.
   f.render_widget(body_widget, chunks[1]);
   if view_len > 0 {
     let rel = app.cursor_row.min(view_len.saturating_sub(1));
@@ -268,9 +272,9 @@ fn highlight_to_spans(text: &str, path: &Path) -> Vec<Line<'static>> {
   let mut h = HighlightLines::new(syntax, &THEME);
 
   let mut lines = Vec::new();
-  for line in LinesWithEndings::from(text) {
-    let display = line.trim_end_matches(&['\n', '\r']);
-    match h.highlight_line(line, &SYNTAX_SET) {
+  for line in text.lines() {
+    let display = sanitize_line(line);
+    match h.highlight_line(&display, &SYNTAX_SET) {
       Ok(hl) => {
         let spans: Vec<_> = hl
           .into_iter()
@@ -288,6 +292,46 @@ fn highlight_to_spans(text: &str, path: &Path) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
   }
   lines
+}
+
+fn sanitize_line(line: &str) -> Cow<'_, str> {
+  // Normalize for terminal rendering:
+  // - drop carriage returns (avoid cursor reset)
+  // - expand tabs to spaces at 8-col stops (predictable indentation)
+  // - replace other control chars with a single space
+  let mut needs_alloc = false;
+  for b in line.bytes() {
+    if b == b'\r' || b == b'\t' || (b < 0x20 && b != b'\n') {
+      needs_alloc = true;
+      break;
+    }
+  }
+  if !needs_alloc {
+    return Cow::Borrowed(line);
+  }
+
+  let mut out = String::with_capacity(line.len());
+  let mut col = 0usize;
+  for ch in line.chars() {
+    match ch {
+      '\r' => {}
+      '\t' => {
+        let tab_stop = 4;
+        let spaces = tab_stop - (col % tab_stop);
+        out.extend(std::iter::repeat(' ').take(spaces));
+        col += spaces;
+      }
+      c if c.is_control() => {
+        out.push(' ');
+        col += 1;
+      }
+      c => {
+        out.push(c);
+        col += c.width().unwrap_or(1).max(1);
+      }
+    }
+  }
+  Cow::Owned(out)
 }
 
 fn rendered_lines(entry: &CommitEntry) -> &Vec<Line<'static>> {
@@ -729,4 +773,39 @@ fn git_output(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     );
   }
   Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn spans_to_string(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.clone()).collect()
+  }
+
+  #[test]
+  fn json_lines_render_without_loss_or_duplication() {
+    let text = concat!(
+      "{\r\n",
+      "  \"imports\": { \"lume/\": \"https://lume.land/x/lume@v2.5.0/\", \"foo\": \"bar\" }\r\n",
+      "  \"tasks\": { \"build\": \"deno task lume\" }\r\n",
+      "}\r\n"
+    );
+    let lines = highlight_to_spans(text, Path::new("deno.json"));
+    let rendered: Vec<String> = lines.iter().map(spans_to_string).collect();
+    let expected = vec![
+      "{",
+      "  \"imports\": { \"lume/\": \"https://lume.land/x/lume@v2.5.0/\", \"foo\": \"bar\" }",
+      "  \"tasks\": { \"build\": \"deno task lume\" }",
+      "}",
+    ];
+    assert_eq!(rendered, expected);
+  }
+
+  #[test]
+  fn sanitize_line_removes_cr_and_controls() {
+    let src = "ab\tcd\ref\u{0008}";
+    let sanitized = sanitize_line(src);
+    assert_eq!(sanitized, "ab  cdef ");
+  }
 }
